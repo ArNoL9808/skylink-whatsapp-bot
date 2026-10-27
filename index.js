@@ -4,22 +4,50 @@ const qrcode = require('qrcode-terminal');
 const { createClient } = require('@supabase/supabase-js');
 const cron = require('node-cron');
 
-// 1. Configuración de Supabase
+// 1. Configuración de Supabase (Usando Service Role Key para privilegios de backend)
 const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_KEY;
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY;
 
 if (!supabaseUrl || !supabaseKey) {
     console.error('Error: Faltan las credenciales de Supabase en el archivo .env');
     process.exit(1);
 }
 
-const supabase = createClient(supabaseUrl, supabaseKey);
+const supabase = createClient(supabaseUrl, supabaseKey, {
+    auth: { persistSession: false }
+});
 
 // Costo fijo de reconexión
 const RECONNECTION_FEE = 100.00;
 
 // 🕒 Función auxiliar para hacer pausas (en milisegundos) y evitar baneos
 const esperar = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// 📱 Función inteligente para formatear el número para WhatsApp según el país
+function formatearNumeroWhatsApp(telefono) {
+    if (!telefono) return null;
+
+    // Quitar todos los caracteres no numéricos
+    let cleanPhone = telefono.replace(/\D/g, '');
+
+    // 1. Si el número tiene 10 dígitos, asumimos México (52) por defecto
+    if (cleanPhone.length === 10) {
+        return `52${cleanPhone}@c.us`;
+    }
+
+    // 2. Si el número tiene 11 dígitos y empieza con 1 (EE. UU. / Canadá)
+    if (cleanPhone.length === 11 && cleanPhone.startsWith('1')) {
+        return `${cleanPhone}@c.us`;
+    }
+
+    // 3. Si tiene más de 10 dígitos y ya trae su código de país integrado
+    if (cleanPhone.length > 10) {
+        return `${cleanPhone}@c.us`;
+    }
+
+    // Por defecto para cualquier otro caso limpio
+    return `${cleanPhone}@c.us`;
+}
 
 // =====================================================================
 // 🤖 CONFIGURACIÓN DE WHATSAPP-WEB.JS
@@ -74,42 +102,55 @@ setInterval(() => {
 // 📬 PROCESAR COLA DE MENSAJES PENDIENTES (Comprobantes de pago, etc.)
 // =====================================================================
 async function procesarMensajesPendientes() {
+    console.log("[BOT] Buscando mensajes pendientes...");
+    
+    // 1. Consultamos únicamente los logs con estatus pendiente
     const { data: pendientes, error } = await supabase
         .from('whatsapp_logs')
-        .select(`
-            id,
-            internet_service_id,
-            message_type,
-            billing_period,
-            payload,
-            user_id,
-            profiles (
-                firstname,
-                phone
-            )
-        `)
+        .select('*')
         .eq('status', 'pending');
 
-    if (error || !pendientes || pendientes.length === 0) {
+    if (error) {
+        console.error("[ERROR SUPABASE] No se pudieron obtener los pendientes:", error.message);
+        return;
+    }
+
+    if (!pendientes || pendientes.length === 0) {
         return; 
     }
 
     console.log(`\n[BOT INSTANTÁNEO] Se encontraron ${pendientes.length} mensaje(s) pendiente(s). Procesando...`);
 
     for (const logItem of pendientes) {
-        const telefono = logItem.profiles?.phone;
-        const mensajeTexto = logItem.payload;
-        const clienteNombre = logItem.profiles?.firstname || 'Cliente';
+        let telefono = null;
+        let clienteNombre = 'Cliente';
+
+        // 2. Buscamos el teléfono y nombre del cliente consultando la tabla profiles usando el user_id del log
+        if (logItem.user_id) {
+            const { data: profileData } = await supabase
+                .from('profiles')
+                .select('firstname, phone')
+                .eq('id', logItem.user_id)
+                .single();
+            
+            if (profileData) {
+                telefono = profileData.phone;
+                clienteNombre = profileData.firstname || 'Cliente';
+            }
+        }
+
+        // Asegurarnos de convertir los \n textuales en saltos de línea reales
+        const mensajeTexto = logItem.payload ? logItem.payload.replace(/\\n/g, '\n') : '';
         const messageType = logItem.message_type;
 
         if (!telefono) {
-            console.log(`[AVISO] El cliente ${clienteNombre} no tiene número de teléfono registrado.`);
+            console.log(`[AVISO] El registro ID ${logItem.id} no tiene un teléfono asociado en perfiles.`);
             await supabase.from('whatsapp_logs').update({ status: 'no_phone' }).eq('id', logItem.id);
             continue;
         }
 
-        const cleanPhone = telefono.replace(/\D/g, '');
-        const formattedNumber = `52${cleanPhone}@c.us`;
+        // Formateo inteligente adaptado a México, USA u otros países
+        const formattedNumber = formatearNumeroWhatsApp(telefono);
 
         try {
             // Validación del número en WhatsApp
@@ -128,10 +169,13 @@ async function procesarMensajesPendientes() {
             await client.sendMessage(chatId._serialized, mensajeTexto);
             console.log(`[ENVIADO] Mensaje [${messageType.toUpperCase()}] enviado exitosamente a ${clienteNombre} (${telefono})`);
 
-            // Actualizar estatus a 'sent'
+            // Actualizar estatus a 'sent' y registrar la fecha real de envío
             await supabase
                 .from('whatsapp_logs')
-                .update({ status: 'sent' })
+                .update({ 
+                    status: 'sent',
+                    sent_at: new Date().toISOString()
+                })
                 .eq('id', logItem.id);
 
             // Pausa de seguridad
@@ -258,9 +302,8 @@ async function verificarYNotificarClientes() {
 
             if (logExistente && logExistente.length > 0) continue; 
 
-            // Validar número en WhatsApp
-            const cleanPhone = telefono.replace(/\D/g, '');
-            const formattedNumber = `52${cleanPhone}@c.us`;
+            // Formatear número mediante la función inteligente
+            const formattedNumber = formatearNumeroWhatsApp(telefono);
             const chatId = await client.getNumberId(formattedNumber);
 
             if (!chatId) {
