@@ -1,6 +1,5 @@
 require('dotenv').config();
 const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
 const { createClient } = require('@supabase/supabase-js');
 const cron = require('node-cron');
 
@@ -69,9 +68,18 @@ const client = new Client({
     }
 });
 
-client.on('qr', (qr) => {
-    console.log('\n[WHATSAPP] Escanea el siguiente código QR con tu aplicación de WhatsApp:\n');
-    qrcode.generate(qr, { small: true });
+// Generación de QR mediante enlace web directo para evitar problemas de lectura en terminal
+client.on('qr', async (qr) => {
+    console.log('\n[WHATSAPP] Generando enlace web para el código QR...');
+    try {
+        const url = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(qr)}`;
+        console.log('\n========================================');
+        console.log(' Abre el siguiente enlace en tu teléfono:');
+        console.log(url);
+        console.log('========================================\n');
+    } catch (err) {
+        console.error('Error al generar la URL del QR:', err);
+    }
 });
 
 client.on('ready', () => {
