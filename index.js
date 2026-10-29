@@ -3,6 +3,7 @@ const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const { createClient } = require('@supabase/supabase-js');
 const cron = require('node-cron');
+const { RouterOSClient } = require('routeros-client');
 
 // 1. Configuración de Supabase (Usando Service Role Key para privilegios de backend)
 const supabaseUrl = process.env.SUPABASE_URL;
@@ -20,33 +21,139 @@ const supabase = createClient(supabaseUrl, supabaseKey, {
 // Costo fijo de reconexión
 const RECONNECTION_FEE = 100.00;
 
-// 🕒 Función auxiliar para hacer pausas (en milisegundos) y evitar baneos
+// Configuración de mapa de routers (Mapeado por mikrotik_id de tu tabla 'locations' o servicios)
+const ROUTERS_CONFIG = {
+    // Puedes agregar aquí los UUIDs de tus mikrotik_id reales y sus respectivas IPs/credenciales
+    'default': {
+        host: process.env.MIKROTIK_HOST || '192.168.8.1',
+        user: process.env.MIKROTIK_USER || 'admin_api',
+        password: process.env.MIKROTIK_PASSWORD || 'tu_password_seguro',
+        port: parseInt(process.env.MIKROTIK_PORT || '8728')
+    }
+};
+
+// Diccionario de Mapeo de Planes y Parámetros de Burst para MikroTik
+const PLANS_CONFIG = {
+    'basic gold': {
+        maxLimit: '5M/5M',
+        burstLimit: '10M/10M',
+        burstThreshold: '3M/3M',
+        burstTime: '8s/8s',
+        queue: 'pcq-upload-default/pcq-download-default'
+    },
+    'advanced': {
+        maxLimit: '10M/10M',
+        burstLimit: '18M/18M',
+        burstThreshold: '7M/7M',
+        burstTime: '8s/8s',
+        queue: 'pcq-upload-default/pcq-download-default'
+    },
+    'advance gold': {
+        maxLimit: '10M/10M',
+        burstLimit: '18M/18M',
+        burstThreshold: '7M/7M',
+        burstTime: '8s/8s',
+        queue: 'pcq-upload-default/pcq-download-default'
+    },
+    'premium': {
+        maxLimit: '20M/20M',
+        burstLimit: '35M/35M',
+        burstThreshold: '14M/14M',
+        burstTime: '8s/8s',
+        queue: 'pcq-upload-default/pcq-download-default'
+    },
+    'premium gold': {
+        maxLimit: '20M/20M',
+        burstLimit: '35M/35M',
+        burstThreshold: '14M/14M',
+        burstTime: '8s/8s',
+        queue: 'pcq-upload-default/pcq-download-default'
+    },
+    'suspendido': {
+        maxLimit: '32k/32k',
+        burstLimit: '0/0',
+        burstThreshold: '0/0',
+        burstTime: '0s/0s',
+        queue: 'default'
+    }
+};
+
+// 🕒 Función auxiliar para hacer pausas (en milisegundos)
 const esperar = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 // 📱 Función inteligente para formatear el número para WhatsApp según el país
 function formatearNumeroWhatsApp(telefono) {
     if (!telefono) return null;
-
-    // Quitar todos los caracteres no numéricos
     let cleanPhone = telefono.replace(/\D/g, '');
 
-    // 1. Si el número tiene 10 dígitos, asumimos México (52) por defecto
     if (cleanPhone.length === 10) {
         return `52${cleanPhone}@c.us`;
     }
-
-    // 2. Si el número tiene 11 dígitos y empieza con 1 (EE. UU. / Canadá)
     if (cleanPhone.length === 11 && cleanPhone.startsWith('1')) {
         return `${cleanPhone}@c.us`;
     }
-
-    // 3. Si tiene más de 10 dígitos y ya trae su código de país integrado
     if (cleanPhone.length > 10) {
         return `${cleanPhone}@c.us`;
     }
-
-    // Por defecto para cualquier otro caso limpio
     return `${cleanPhone}@c.us`;
+}
+
+// =====================================================================
+// 🛜 MÓDULO DE CONTROL MIKROTIK (POR IP Y MIKROTIK_ID)
+// =====================================================================
+async function aplicarCambioEnMikroTikPorIP(ipCliente, mikrotikId, tipoAccion, nombrePlan) {
+    if (!ipCliente) {
+        console.log(`[MikroTik] ⚠️ No se puede aplicar cambios: El cliente no tiene IP registrada.`);
+        return false;
+    }
+
+    // Seleccionar el router correspondiente o usar el default
+    const targetRouter = ROUTERS_CONFIG[mikrotikId] || ROUTERS_CONFIG['default'];
+    const client = new RouterOSClient(targetRouter);
+
+    try {
+        const api = await client.connect();
+        
+        // Buscar la Simple Queue cuyo target contenga la IP del cliente de forma exacta
+        const queues = await api.menu('/queue/simple').get();
+        const queueCliente = queues.find(q => q.target && q.target.includes(ipCliente));
+        
+        if (!queueCliente) {
+            console.log(`[MikroTik] ⚠️ No se encontró ninguna Simple Queue con la IP: ${ipCliente} en el router ID: ${mikrotikId}`);
+            await client.close();
+            return false;
+        }
+
+        const queueId = queueCliente['.id'];
+        let configPlan;
+        let comentario;
+
+        if (tipoAccion === 'suspender') {
+            configPlan = PLANS_CONFIG['suspendido'];
+            comentario = `SUSPENDIDO - IP: ${ipCliente}`;
+        } else {
+            const planKey = Object.keys(PLANS_CONFIG).find(p => nombrePlan.toLowerCase().includes(p)) || 'advance gold';
+            configPlan = PLANS_CONFIG[planKey];
+            comentario = `Plan Activo: ${nombrePlan} (${ipCliente})`;
+        }
+
+        // Aplicar la actualización en la Simple Queue de RouterOS vía API
+        await api.menu('/queue/simple').update(queueId, {
+            'max-limit': configPlan.maxLimit,
+            'burst-limit': configPlan.burstLimit,
+            'burst-threshold': configPlan.burstThreshold,
+            'burst-time': configPlan.burstTime,
+            'queue': configPlan.queue,
+            comment: comentario
+        });
+
+        console.log(`[MikroTik] ✅ Éxito: IP ${ipCliente} actualizada a perfil [${tipoAccion.toUpperCase()}] (${comentario})`);
+        await client.close();
+        return true;
+    } catch (error) {
+        console.error(`[MikroTik] ❌ Error al modificar IP ${ipCliente} en MikroTik:`, error.message);
+        return false;
+    }
 }
 
 // =====================================================================
@@ -79,9 +186,9 @@ client.on('ready', () => {
     console.log(' ¡Bot de WhatsApp CONECTADO y listo! 🚀');
     console.log('========================================\n');
     
-    // Una vez listo WhatsApp, procesamos mensajes pendientes y escaneamos
     procesarMensajesPendientes();
     verificarYNotificarClientes();
+    iniciarEscuchasRealtimeSupabase();
 });
 
 client.on('auth_failure', msg => {
@@ -96,119 +203,150 @@ client.on('disconnected', (reason) => {
 client.initialize();
 
 // =====================================================================
+// ⚡ SUPABASE REALTIME (ESCUCHA AUTOMÁTICA DE CAMBIOS EN VIVO)
+// =====================================================================
+function iniciarEscuchasRealtimeSupabase() {
+    console.log('[SUPABASE REALTIME] Activando escuchas en tiempo real...');
+
+    // 1. Escuchar cambios en internet_services (Para automatizar cortes / reconexiones en MikroTik por IP)
+    supabase
+      .channel('service-changes-channel')
+      .on(
+        'postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'internet_services' },
+        async (payload) => {
+          const nuevoServicio = payload.new;
+          const servicioAnterior = payload.old;
+
+          if (nuevoServicio.is_suspended !== servicioAnterior.is_suspended || nuevoServicio.status !== servicioAnterior.status) {
+              const { data: plan } = await supabase.from('plans').select('name').eq('id', nuevoServicio.plan_id).single();
+              
+              const ipCliente = nuevoServicio.ip;
+              const mikrotikId = nuevoServicio.mikrotik_id;
+              const planName = plan?.name || 'advance gold';
+
+              if (ipCliente) {
+                  if (nuevoServicio.is_suspended || nuevoServicio.status === 'suspended' || nuevoServicio.status === 'cut') {
+                      console.log(`[REALTIME] Detectada suspensión/corte para IP: ${ipCliente}`);
+                      await aplicarCambioEnMikroTikPorIP(ipCliente, mikrotikId, 'suspender', planName);
+                  } else if (!nuevoServicio.is_suspended && nuevoServicio.status === 'active') {
+                      console.log(`[REALTIME] Detectada reconexión/pago para IP: ${ipCliente}`);
+                      await aplicarCambioEnMikroTikPorIP(ipCliente, mikrotikId, 'reconectar', planName);
+                  }
+              }
+          }
+        }
+      )
+      .subscribe();
+
+    // 2. Escuchar la cola de WhatsApp (whatsapp_logs) para envío de comprobantes instantáneos
+    supabase
+      .channel('whatsapp-queue-channel')
+      .on(
+        'postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'whatsapp_logs' },
+        async (payload) => {
+          const logItem = payload.new;
+          if (logItem.status === 'pending') {
+              console.log(`[REALTIME] Nuevo mensaje pendiente detectado (ID: ${logItem.id})`);
+              procesarMensajeIndividual(logItem);
+          }
+        }
+      )
+      .subscribe();
+}
+
+// =====================================================================
 // ⏰ PROGRAMACIÓN DE TAREAS (CRON & INTERVAL)
 // =====================================================================
-
-// A. Tarea Diaria (9:00 AM): Evalúa cobros y notificaciones
 cron.schedule('0 9 * * *', () => {
     console.log(`[${new Date().toLocaleString()}] Ejecutando revisión diaria automática de cobros...`);
     verificarYNotificarClientes();
 });
 
-// B. Tarea Continua (Cada 30 segundos): Revisa cola de comprobantes / mensajes instantáneos
 setInterval(() => {
     procesarMensajesPendientes();
 }, 30000);
 
-
 // =====================================================================
-// 📬 PROCESAR COLA DE MENSAJES PENDIENTES (Comprobantes de pago, etc.)
+// 📬 PROCESAR COLA DE MENSAJES PENDIENTES
 // =====================================================================
 async function procesarMensajesPendientes() {
-    console.log("[BOT] Buscando mensajes pendientes...");
-    
-    // 1. Consultamos únicamente los logs con estatus pendiente
     const { data: pendientes, error } = await supabase
         .from('whatsapp_logs')
         .select('*')
         .eq('status', 'pending');
 
-    if (error) {
-        console.error("[ERROR SUPABASE] No se pudieron obtener los pendientes:", error.message);
+    if (error || !pendientes || pendientes.length === 0) return;
+
+    console.log(`\n[BOT PENDIENTES] Se encontraron ${pendientes.length} mensaje(s) por enviar.`);
+
+    for (const logItem of pendientes) {
+        await procesarMensajeIndividual(logItem);
+    }
+}
+
+async function procesarMensajeIndividual(logItem) {
+    let telefono = null;
+    let clienteNombre = 'Cliente';
+
+    if (logItem.user_id) {
+        const { data: profileData } = await supabase
+            .from('profiles')
+            .select('firstname, phone')
+            .eq('id', logItem.user_id)
+            .single();
+        
+        if (profileData) {
+            telefono = profileData.phone;
+            clienteNombre = profileData.firstname || 'Cliente';
+        }
+    }
+
+    const mensajeTexto = logItem.payload ? logItem.payload.replace(/\\n/g, '\n') : '';
+
+    if (!telefono) {
+        await supabase.from('whatsapp_logs').update({ status: 'no_phone' }).eq('id', logItem.id);
         return;
     }
 
-    if (!pendientes || pendientes.length === 0) {
-        return; 
-    }
+    const formattedNumber = formatearNumeroWhatsApp(telefono);
 
-    console.log(`\n[BOT INSTANTÁNEO] Se encontraron ${pendientes.length} mensaje(s) pendiente(s). Procesando...`);
-
-    for (const logItem of pendientes) {
-        let telefono = null;
-        let clienteNombre = 'Cliente';
-
-        // 2. Buscamos el teléfono y nombre del cliente consultando la tabla profiles usando el user_id del log
-        if (logItem.user_id) {
-            const { data: profileData } = await supabase
-                .from('profiles')
-                .select('firstname, phone')
-                .eq('id', logItem.user_id)
-                .single();
-            
-            if (profileData) {
-                telefono = profileData.phone;
-                clienteNombre = profileData.firstname || 'Cliente';
-            }
+    try {
+        const chatId = await client.getNumberId(formattedNumber);
+        
+        if (!chatId) {
+            await supabase.from('whatsapp_logs').update({ status: 'no_whatsapp' }).eq('id', logItem.id);
+            return;
         }
 
-        // Asegurarnos de convertir los \n textuales en saltos de línea reales
-        const mensajeTexto = logItem.payload ? logItem.payload.replace(/\\n/g, '\n') : '';
-        const messageType = logItem.message_type;
+        await client.sendMessage(chatId._serialized, mensajeTexto);
+        console.log(`[ENVIADO] Mensaje [${logItem.message_type?.toUpperCase()}] enviado a ${clienteNombre} (${telefono})`);
 
-        if (!telefono) {
-            console.log(`[AVISO] El registro ID ${logItem.id} no tiene un teléfono asociado en perfiles.`);
-            await supabase.from('whatsapp_logs').update({ status: 'no_phone' }).eq('id', logItem.id);
-            continue;
-        }
+        await supabase
+            .from('whatsapp_logs')
+            .update({ 
+                status: 'sent',
+                sent_at: new Date().toISOString()
+            })
+            .eq('id', logItem.id);
 
-        // Formateo inteligente adaptado a México, USA u otros países
-        const formattedNumber = formatearNumeroWhatsApp(telefono);
+        await esperar(3000);
 
-        try {
-            // Validación del número en WhatsApp
-            const chatId = await client.getNumberId(formattedNumber);
-            
-            if (!chatId) {
-                console.log(`[AVISO] El número de ${clienteNombre} (${telefono}) no tiene WhatsApp o no es válido.`);
-                await supabase
-                    .from('whatsapp_logs')
-                    .update({ status: 'no_whatsapp' })
-                    .eq('id', logItem.id);
-                continue;
-            }
-
-            // Envío del mensaje
-            await client.sendMessage(chatId._serialized, mensajeTexto);
-            console.log(`[ENVIADO] Mensaje [${messageType.toUpperCase()}] enviado exitosamente a ${clienteNombre} (${telefono})`);
-
-            // Actualizar estatus a 'sent' y registrar la fecha real de envío
-            await supabase
-                .from('whatsapp_logs')
-                .update({ 
-                    status: 'sent',
-                    sent_at: new Date().toISOString()
-                })
-                .eq('id', logItem.id);
-
-            // Pausa de seguridad
-            await esperar(3000);
-
-        } catch (err) {
-            console.error(`[ERROR] Falló el envío para ${clienteNombre}:`, err.message);
-        }
+    } catch (err) {
+        console.error(`[ERROR] Falló el envío para ${clienteNombre}:`, err.message);
     }
 }
 
 // =====================================================================
-// 🔍 MOTOR PRINCIPAL: EVALUAR CLIENTES Y ENVIAR RECORDATORIOS/CORTES
+// 🔍 MOTOR PRINCIPAL: EVALUAR CLIENTES Y RECORDATORIOS/CORTES
 // =====================================================================
 async function verificarYNotificarClientes() {
     const hoy = new Date();
     hoy.setHours(0, 0, 0, 0);
 
     console.log(`\n========================================`);
-    console.log(`[PRODUCCIÓN] Fecha real evaluada como "Hoy": ${hoy.toISOString().split('T')[0]}`);
+    console.log(`[PRODUCCIÓN] Fecha evaluada como "Hoy": ${hoy.toISOString().split('T')[0]}`);
     console.log(`========================================\n`);
 
     const { data: locationsData } = await supabase.from('locations').select('*');
@@ -222,7 +360,6 @@ async function verificarYNotificarClientes() {
         });
     }
 
-    // Consultamos TODOS los servicios activos, cortados o suspendidos
     const { data: servicios, error } = await supabase
         .from('internet_services')
         .select(`
@@ -234,6 +371,7 @@ async function verificarYNotificarClientes() {
             is_suspended,
             user_id,
             plans (
+                name,
                 price
             ),
             profiles!inner (
@@ -258,9 +396,12 @@ async function verificarYNotificarClientes() {
         const firstname = servicio.profiles.firstname;
         const telefono = servicio.profiles.phone;
         const monthlyPrice = parseFloat(servicio.plans?.price || 0);
+        const planName = servicio.plans?.name || 'advance gold';
         const billingPeriod = servicio.next_due_date;
+        const ipCliente = servicio.ip;
+        const mikrotikId = servicio.mikrotik_id;
 
-        const locInfo = locationsMap[servicio.mikrotik_id] || { tolerance_days: 7 };
+        const locInfo = locationsMap[mikrotikId] || { tolerance_days: 7 };
         const diasTolerancia = locInfo.tolerance_days;
 
         const dueDate = new Date(servicio.next_due_date + 'T00:00:00');
@@ -281,7 +422,7 @@ async function verificarYNotificarClientes() {
                            `💰 Monto: $${monthlyPrice}\n\n` +
                            `Recuerda pagar dentro del plazo establecido para evitar cargos extra. ¡Gracias por confiar en SkyLink!` + footer;
         } 
-        // 2. Pasó tolerancia pero no más de 5 días -> Aviso de Corte por falta de pago
+        // 2. Pasó tolerancia pero no más de 5 días -> Aviso de Corte
         else if (diffDays > diasTolerancia && diffDays <= (diasTolerancia + 5) && servicio.status !== 'suspended') {
             messageType = 'cortado';
             const totalWithFee = monthlyPrice + RECONNECTION_FEE;
@@ -290,8 +431,14 @@ async function verificarYNotificarClientes() {
                            `*Estado de cuenta:* \n` +
                            `💰 Total con recargo de reconexión: $${totalWithFee}\n\n` +
                            `Evita la suspensión definitiva de tu servicio realizando tu pago a la brevedad.` + footer;
+            
+            // Aplicar corte automático en MikroTik por IP
+            if (ipCliente) {
+                await aplicarCambioEnMikroTikPorIP(ipCliente, mikrotikId, 'suspender', planName);
+                await supabase.from('internet_services').update({ is_suspended: true, status: 'cut' }).eq('id', servicio.id);
+            }
         } 
-        // 3. Pasaron más de 5 días adicionales -> Aviso de Suspensión definitiva
+        // 3. Suspensión definitiva
         else if (diffDays > (diasTolerancia + 5) && servicio.status !== 'suspended') {
             messageType = 'suspendido';
             const totalWithFee = monthlyPrice + RECONNECTION_FEE;
@@ -301,10 +448,14 @@ async function verificarYNotificarClientes() {
                            `💰 Total a pagar: $${totalWithFee}\n` +
                            `📝 Incluye: Recargo por reconexión\n\n` +
                            `Realiza tu pago para reactivar tu señal de inmediato. ¡Gracias!` + footer;
+            
+            if (ipCliente) {
+                await aplicarCambioEnMikroTikPorIP(ipCliente, mikrotikId, 'suspender', planName);
+                await supabase.from('internet_services').update({ is_suspended: true, status: 'suspended' }).eq('id', servicio.id);
+            }
         }
 
         if (messageType) {
-            // Verificar si ya le enviamos un mensaje del mismo tipo para este periodo
             const { data: logExistente } = await supabase
                 .from('whatsapp_logs')
                 .select('id')
@@ -315,16 +466,11 @@ async function verificarYNotificarClientes() {
 
             if (logExistente && logExistente.length > 0) continue; 
 
-            // Formatear número mediante la función inteligente
             const formattedNumber = formatearNumeroWhatsApp(telefono);
             const chatId = await client.getNumberId(formattedNumber);
 
-            if (!chatId) {
-                console.log(`[AVISO] El cliente ${firstname} (${telefono}) no tiene WhatsApp activo. Se omite.`);
-                continue;
-            }
+            if (!chatId) continue;
 
-            // Registrar log
             await supabase.from('whatsapp_logs').insert([{
                 user_id: servicio.user_id,
                 internet_service_id: servicio.id,
@@ -335,17 +481,14 @@ async function verificarYNotificarClientes() {
             }]);
 
             contadorAcciones++;
-
-            // Enviar mensaje
             await client.sendMessage(chatId._serialized, mensajeTexto);
             console.log(`[COBRO AUTOMÁTICO] Mensaje [${messageType}] enviado a ${firstname} (${telefono})`);
 
-            // Pausa de seguridad anti-spam
             await esperar(5000);
         }
     }
 
     console.log(`\n========================================`);
-    console.log(` Escaneo diario finalizado. Acciones ejecutadas: ${contadorAcciones}`);
+    console.log(` Escaneo diario finalizado. Acciones: ${contadorAcciones}`);
     console.log(`========================================\n`);
 }
