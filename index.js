@@ -213,7 +213,7 @@ client.on('disconnected', (reason) => {
 client.initialize();
 
 // =====================================================================
-// ⚡ SUPABASE REALTIME (MAPA EN MEMORIA CONTRA FALSOS POSITIVOS)
+// ⚡ SUPABASE REALTIME (MAPA EN MEMORIA BLINDADO CONTRA FALSOS POSITIVOS)
 // =====================================================================
 const estadosClientesMemoria = new Map();
 
@@ -240,21 +240,17 @@ function iniciarEscuchasRealtimeSupabase() {
                     status: nuevoServicio.status
                 };
 
-                // Si es la primera vez que vemos este servicio en memoria, lo guardamos sin disparar acciones
-                if (!estadosClientesMemoria.has(servicioId)) {
-                    estadosClientesMemoria.set(servicioId, estadoActual);
-                    console.log(`[REALTIME] ℹ️ Servicio ${servicioId} registrado en memoria.`);
-                    return;
-                }
+                // Si no está en memoria, asumimos un estado anterior 'active' por defecto 
+                // para que si el primer evento ya viene suspendido, ¡SÍ ejecute la acción!
+                const estadoAnterior = estadosClientesMemoria.get(servicioId) || { is_suspended: false, status: 'active' };
 
-                const estadoAnterior = estadosClientesMemoria.get(servicioId);
-
-                // Comparamos el estado real en memoria contra el nuevo recibido
+                // Comparamos el estado anterior contra el nuevo recibido
                 const cambioSuspension = estadoActual.is_suspended !== estadoAnterior.is_suspended;
                 const cambioEstatus = estadoActual.status !== estadoAnterior.status;
 
                 // 🛡️ Si actualizan IP, notas o cualquier otro dato general, lo ignoramos por completo
                 if (!cambioSuspension && !cambioEstatus) {
+                    estadosClientesMemoria.set(servicioId, estadoActual);
                     console.log(`[REALTIME] ℹ️ Actualización de datos generales ignorada (IP/Notas/etc.) para el servicio ID: ${servicioId}`);
                     return;
                 }
