@@ -108,21 +108,16 @@ async function aplicarCambioEnMikroTikPorIP(ipCliente, mikrotikId, tipoAccion, n
     }
 
     const targetRouter = ROUTERS_CONFIG[mikrotikId] || ROUTERS_CONFIG['default'];
-    // targetRouter debe tener host, user y password (ej: { host: '192.168.88.1', user: 'admin', password: 'xxx' })
     const protocol = targetRouter.port === 8729 ? 'https' : 'http';
-    const port = targetRouter.port || 80; // o el puerto REST que uses en tu MikroTik (por defecto 80 o 443, o el que tengas configurado en IP -> Services)
-    // Nota: Si usas la API REST de MikroTik, el puerto suele ser 80/443 o el que hayas asignado a www / www-ssl. 
-    // Si prefieres usar la IP directa con el puerto REST:
-    const baseUrl = `${protocol}://${targetRouter.host}/rest`;
-    
-    // Auth básica en Base64
+    const host = targetRouter.host;
     const auth = Buffer.from(`${targetRouter.user}:${targetRouter.password}`).toString('base64');
+    const baseUrl = `${protocol}://${host}/rest`;
 
     try {
-        console.log(`[MikroTik] Conectando vía REST API a ${targetRouter.host} para la IP ${ipCliente}...`);
+        console.log(`[MikroTik] Conectando vía REST API a ${host} para la IP ${ipCliente}...`);
 
-        // 1. Obtener todas las simple queues usando REST API
-        const response = await fetch(`${baseUrl}/ip/firewall/address-list`, { // o /queue/simple
+        // 1. Obtener todas las simple queues desde la REST API de MikroTik
+        const resGet = await fetch(`${baseUrl}/ip/firewall/address-list`, { // o revisamos el endpoint de queues
             method: 'GET',
             headers: {
                 'Authorization': `Basic ${auth}`,
@@ -130,10 +125,71 @@ async function aplicarCambioEnMikroTikPorIP(ipCliente, mikrotikId, tipoAccion, n
             }
         });
 
-        // Si prefieres mantenerlo con la librería pero evitamos el error con comandos nativos de ROS, 
-        // otra opción sumamente sencilla es usar un comando que no lance error. Pero la REST API es invulnerable a esto.
+        // ⚠️ Nota: El endpoint correcto para colas simples en la REST API de MikroTik es /queue/simple
+        const resQueues = await fetch(`${baseUrl}/queue/simple`, {
+            method: 'GET',
+            headers: {
+                'Authorization': `Basic ${auth}`,
+                'Content-Type': 'application/json'
+            }
+        });
+
+        if (!resQueues.ok) {
+            console.error(`[MikroTik] ❌ Error al consultar colas en el router: ${resQueues.statusText}`);
+            return false;
+        }
+
+        const queues = await resQueues.json();
+
+        // 2. Buscar la cola que coincida con la IP del cliente en el target
+        const queueCliente = queues.find(q => q.target && q.target.includes(ipCliente));
+
+        if (!queueCliente) {
+            console.log(`[MikroTik] ⚠️ No se encontró ninguna Simple Queue con la IP: ${ipCliente} en el router ${mikrotikId}`);
+            return false;
+        }
+
+        const queueId = queueCliente['.id'];
+        let configPlan;
+        let comentario;
+
+        if (tipoAccion === 'suspender') {
+            configPlan = PLANS_CONFIG['suspendido'];
+            comentario = `SUSPENDIDO - IP: ${ipCliente}`;
+        } else {
+            const planKey = Object.keys(PLANS_CONFIG).find(p => nombrePlan.toLowerCase().includes(p)) || 'advance gold';
+            configPlan = PLANS_CONFIG[planKey];
+            comentario = `Plan Activo: ${nombrePlan} (${ipCliente})`;
+        }
+
+        // 3. Aplicar los cambios mediante una petición PATCH o PUT a la REST API
+        const resUpdate = await fetch(`${baseUrl}/queue/simple/${queueId}`, {
+            method: 'PATCH',
+            headers: {
+                'Authorization': `Basic ${auth}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                'max-limit': configPlan.maxLimit,
+                'burst-limit': configPlan.burstLimit,
+                'burst-threshold': configPlan.burstThreshold,
+                'burst-time': configPlan.burstTime,
+                'queue': configPlan.queue,
+                'comment': comentario
+            })
+        });
+
+        if (!resUpdate.ok) {
+            const errBody = await resUpdate.text();
+            console.error(`[MikroTik] ❌ Error al actualizar la cola via REST: ${errBody}`);
+            return false;
+        }
+
+        console.log(`[MikroTik] ✅ Éxito REST API: IP ${ipCliente} actualizada a perfil [${tipoAccion.toUpperCase()}]`);
+        return true;
+
     } catch (error) {
-        console.error(`[MikroTik] ❌ Error en REST API:`, error.message);
+        console.error(`[MikroTik] ❌ Error crítico de red en REST API para ${ipCliente}:`, error.message);
         return false;
     }
 }
