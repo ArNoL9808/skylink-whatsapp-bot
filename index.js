@@ -107,7 +107,6 @@ async function aplicarCambioEnMikroTikPorIP(ipCliente, mikrotikId, tipoAccion, n
         return false;
     }
 
-    // Seleccionar el router correspondiente o usar el default
     const targetRouter = ROUTERS_CONFIG[mikrotikId] || ROUTERS_CONFIG['default'];
     const client = new RouterOSClient(targetRouter);
 
@@ -116,20 +115,21 @@ async function aplicarCambioEnMikroTikPorIP(ipCliente, mikrotikId, tipoAccion, n
         
         let queues = [];
         try {
-            // Intentar obtener las colas simples protegiéndonos de respuestas vacías del router
-            queues = await api.menu('/queue/simple').get();
+            // Forzamos la lectura usando .toArray() o capturando el evento de error del canal si la librería lo permite
+            queues = await api.menu('/queue/simple').getAll();
         } catch (routerErr) {
-            console.log(`[MikroTik] ⚠️ Advertencia al leer colas (posible respuesta vacía del router):`, routerErr.message);
+            console.log(`[MikroTik] ⚠️ Nota al obtener colas (posible lista vacía o respuesta del router):`, routerErr.message);
             queues = [];
         }
 
+        // Si no devolvió un arreglo o está vacío
         if (!Array.isArray(queues) || queues.length === 0) {
-            console.log(`[MikroTik] ⚠️ No se obtuvieron colas simples o el router respondió vacío.`);
+            console.log(`[MikroTik] ⚠️ No hay Simple Queues registradas o el router respondió vacío.`);
             await client.close();
             return false;
         }
 
-        // Buscar la Simple Queue cuyo target contenga la IP del cliente de forma exacta
+        // Buscar la Simple Queue cuyo target contenga la IP del cliente
         const queueCliente = queues.find(q => q.target && q.target.includes(ipCliente));
         
         if (!queueCliente) {
@@ -151,7 +151,7 @@ async function aplicarCambioEnMikroTikPorIP(ipCliente, mikrotikId, tipoAccion, n
             comentario = `Plan Activo: ${nombrePlan} (${ipCliente})`;
         }
 
-        // Aplicar la actualización en la Simple Queue de RouterOS vía API
+        // Aplicar la actualización
         await api.menu('/queue/simple').update(queueId, {
             'max-limit': configPlan.maxLimit,
             'burst-limit': configPlan.burstLimit,
@@ -165,7 +165,7 @@ async function aplicarCambioEnMikroTikPorIP(ipCliente, mikrotikId, tipoAccion, n
         await client.close();
         return true;
     } catch (error) {
-        console.error(`[MikroTik] ❌ Error crítico al modificar IP ${ipCliente} en MikroTik:`, error.message);
+        console.error(`[MikroTik] ❌ Error general en la conexión/router para la IP ${ipCliente}:`, error.message);
         try { await client.close(); } catch(e) {}
         return false;
     }
