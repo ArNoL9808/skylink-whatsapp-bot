@@ -219,7 +219,7 @@ client.on('disconnected', (reason) => {
 client.initialize();
 
 // =====================================================================
-// ⚡ SUPABASE REALTIME (ESCUCHA AUTOMÁTICA + NOTIFICACIÓN WHATSAPP)
+// ⚡ SUPABASE REALTIME (ESCUCHA AUTOMÁTICA BLINDADA CONTRA FALSOS POSITIVOS)
 // =====================================================================
 function iniciarEscuchasRealtimeSupabase() {
     console.log('[SUPABASE REALTIME] Activando escuchas en tiempo real...');
@@ -235,75 +235,90 @@ function iniciarEscuchasRealtimeSupabase() {
                 const nuevoServicio = payload.new;
                 const servicioAnterior = payload.old;
 
-                if (
-                    nuevoServicio.is_suspended !== servicioAnterior.is_suspended ||
-                    nuevoServicio.status !== servicioAnterior.status
-                ) {
-                    console.log(`[REALTIME] Cambio detectado para el cliente con IP: ${nuevoServicio.ip || 'Sin IP'}`);
+                // 🛡️ FILTRO DE SEGURIDAD: 
+                // Verificamos estrictamente si los campos de control crítico realmente cambiaron de valor.
+                const cambioSuspension = nuevoServicio.is_suspended !== servicioAnterior.is_suspended;
+                const cambioEstatus = nuevoServicio.status !== servicioAnterior.status;
 
-                    const ipCliente = nuevoServicio.ip;
-                    const mikrotikId = nuevoServicio.mikrotik_id || 'default';
-                    const planId = nuevoServicio.plan_id;
-                    const userId = nuevoServicio.user_id;
+                // Si se actualizaron otros campos (como IP, notas, ONU, etc.) pero el estatus y la 
+                // suspensión siguen siendo exactamente iguales, IGNORAMOS el evento por completo.
+                if (!cambioSuspension && !cambioEstatus) {
+                    console.log(`[REALTIME] ℹ️ Actualización de datos generales ignorada (IP/Notas/etc.) para el servicio ID: ${nuevoServicio.id}`);
+                    return;
+                }
 
-                    let tipoAccion = null;
-                    let tipoMensajeWhatsApp = null;
+                console.log(`[REALTIME] ⚠️ Cambio real detectado en estatus/suspensión para la IP: ${nuevoServicio.ip || 'Sin IP'}`);
 
-                    if (nuevoServicio.is_suspended || nuevoServicio.status === 'suspended' || nuevoServicio.status === 'inactive' || nuevoServicio.status === 'cut') {
-                        console.log(`[REALTIME] 🔴 El servicio fue SUSPENDIDO. Aplicando corte en MikroTik...`);
+                const ipCliente = nuevoServicio.ip;
+                const mikrotikId = nuevoServicio.mikrotik_id || 'default';
+                const planId = nuevoServicio.plan_id;
+                const userId = nuevoServicio.user_id;
+
+                let tipoAccion = null;
+                let tipoMensajeWhatsApp = null;
+
+                // Evaluamos las banderas de forma precisa
+                if (nuevoServicio.is_suspended || nuevoServicio.status === 'suspended' || nuevoServicio.status === 'inactive' || nuevoServicio.status === 'cut') {
+                    // Solo procedemos si el estado anterior NO estaba ya suspendido/cortado 
+                    // (evita disparos dobles si Supabase manda múltiples eventos de un mismo cambio)
+                    if (!servicioAnterior.is_suspended && servicioAnterior.status === 'active') {
+                        console.log(`[REALTIME] 🔴 El servicio cambió a SUSPENDIDO. Aplicando corte en MikroTik...`);
                         tipoAccion = 'suspender';
                         tipoMensajeWhatsApp = 'suspendido';
-                    } else if (!nuevoServicio.is_suspended && nuevoServicio.status === 'active') {
-                        console.log(`[REALTIME] 🟢 El servicio fue ACTIVADO/PAGADO. Restaurando velocidad en MikroTik...`);
+                    }
+                } else if (!nuevoServicio.is_suspended && nuevoServicio.status === 'active') {
+                    // Solo procedemos si antes estaba suspendido o cortado
+                    if (servicioAnterior.is_suspended || servicioAnterior.status === 'suspended' || servicioAnterior.status === 'cut' || servicioAnterior.status === 'inactive') {
+                        console.log(`[REALTIME] 🟢 El servicio cambió a ACTIVO. Restaurando velocidad en MikroTik...`);
                         tipoAccion = 'activar';
                         tipoMensajeWhatsApp = 'activado';
                     }
+                }
 
-                    if (tipoAccion) {
-                        // 1. Aplicar cambios en MikroTik consultando la BD
-                        await aplicarCambioEnMikroTikPorIP(ipCliente, mikrotikId, tipoAccion, planId);
+                if (tipoAccion) {
+                    // 1. Aplicar cambios en MikroTik consultando la BD
+                    await aplicarCambioEnMikroTikPorIP(ipCliente, mikrotikId, tipoAccion, planId);
 
-                        // 2. Enviar WhatsApp al cliente
-                        if (userId) {
-                            const { data: profileData } = await supabase
-                                .from('profiles')
-                                .select('firstname, phone')
-                                .eq('id', userId)
-                                .single();
+                    // 2. Enviar WhatsApp al cliente
+                    if (userId) {
+                        const { data: profileData } = await supabase
+                            .from('profiles')
+                            .select('firstname, phone')
+                            .eq('id', userId)
+                            .single();
 
-                            if (profileData && profileData.phone) {
-                                const firstname = profileData.firstname || 'Cliente';
-                                const telefono = profileData.phone;
-                                const footer = "\n\n_Este mensaje es automático, no es necesario responder a menos de que tenga dudas referentes al pago._";
+                        if (profileData && profileData.phone) {
+                            const firstname = profileData.firstname || 'Cliente';
+                            const telefono = profileData.phone;
+                            const footer = "\n\n_Este mensaje es automático, no es necesario responder a menos de que tenga dudas referentes al pago._";
+                            
+                            let mensajeTexto = "";
+
+                            if (tipoMensajeWhatsApp === 'suspendido') {
+                                mensajeTexto = `*¡Aviso de Suspensión SkyLink!* 🚫\n\n` +
+                                               `Hola *${firstname}*, tu servicio de internet ha sido *suspendido* temporalmente por falta de pago.\n\n` +
+                                               `Realiza tu pago para reactivar tu señal de inmediato de forma automática. ¡Gracias!` + footer;
+                            } else if (tipoMensajeWhatsApp === 'activado') {
+                                mensajeTexto = `*¡Servicio Reactivado SkyLink!* 🟢\n\n` +
+                                               `Hola *${firstname}*, hemos detectado tu pago con éxito. Tu servicio de internet ha sido *restaurado* al 100%.\n\n` +
+                                               `¡Gracias por estar al corriente con SkyLink! Que disfrutes tu conexión.` + footer;
+                            }
+
+                            const formattedNumber = formatearNumeroWhatsApp(telefono);
+                            const chatId = await client.getNumberId(formattedNumber);
+
+                            if (chatId) {
+                                await client.sendMessage(chatId._serialized, mensajeTexto);
+                                console.log(`[WHATSAPP REALTIME] Mensaje de [${tipoMensajeWhatsApp}] enviado a ${firstname} (${telefono})`);
                                 
-                                let mensajeTexto = "";
-
-                                if (tipoMensajeWhatsApp === 'suspendido') {
-                                    mensajeTexto = `*¡Aviso de Suspensión SkyLink!* 🚫\n\n` +
-                                                   `Hola *${firstname}*, tu servicio de internet ha sido *suspendido* temporalmente por falta de pago.\n\n` +
-                                                   `Realiza tu pago para reactivar tu señal de inmediato de forma automática. ¡Gracias!` + footer;
-                                } else if (tipoMensajeWhatsApp === 'activado') {
-                                    mensajeTexto = `*¡Servicio Reactivado SkyLink!* 🟢\n\n` +
-                                                   `Hola *${firstname}*, hemos detectado tu pago con éxito. Tu servicio de internet ha sido *restaurado* al 100%.\n\n` +
-                                                   `¡Gracias por estar al corriente con SkyLink! Que disfrutes tu conexión.` + footer;
-                                }
-
-                                const formattedNumber = formatearNumeroWhatsApp(telefono);
-                                const chatId = await client.getNumberId(formattedNumber);
-
-                                if (chatId) {
-                                    await client.sendMessage(chatId._serialized, mensajeTexto);
-                                    console.log(`[WHATSAPP REALTIME] Mensaje de [${tipoMensajeWhatsApp}] enviado a ${firstname} (${telefono})`);
-                                    
-                                    await supabase.from('whatsapp_logs').insert([{
-                                        user_id: userId,
-                                        internet_service_id: nuevoServicio.id,
-                                        message_type: tipoMensajeWhatsApp,
-                                        billing_period: nuevoServicio.next_due_date || new Date().toISOString().split('T')[0],
-                                        status: 'sent',
-                                        payload: mensajeTexto
-                                    }]);
-                                }
+                                await supabase.from('whatsapp_logs').insert([{
+                                    user_id: userId,
+                                    internet_service_id: nuevoServicio.id,
+                                    message_type: tipoMensajeWhatsApp,
+                                    billing_period: nuevoServicio.next_due_date || new Date().toISOString().split('T')[0],
+                                    status: 'sent',
+                                    payload: mensajeTexto
+                                }]);
                             }
                         }
                     }
