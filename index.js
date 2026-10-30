@@ -114,8 +114,22 @@ async function aplicarCambioEnMikroTikPorIP(ipCliente, mikrotikId, tipoAccion, n
     try {
         const api = await client.connect();
         
+        let queues = [];
+        try {
+            // Intentar obtener las colas simples protegiéndonos de respuestas vacías del router
+            queues = await api.menu('/queue/simple').get();
+        } catch (routerErr) {
+            console.log(`[MikroTik] ⚠️ Advertencia al leer colas (posible respuesta vacía del router):`, routerErr.message);
+            queues = [];
+        }
+
+        if (!Array.isArray(queues) || queues.length === 0) {
+            console.log(`[MikroTik] ⚠️ No se obtuvieron colas simples o el router respondió vacío.`);
+            await client.close();
+            return false;
+        }
+
         // Buscar la Simple Queue cuyo target contenga la IP del cliente de forma exacta
-        const queues = await api.menu('/queue/simple').get();
         const queueCliente = queues.find(q => q.target && q.target.includes(ipCliente));
         
         if (!queueCliente) {
@@ -151,7 +165,8 @@ async function aplicarCambioEnMikroTikPorIP(ipCliente, mikrotikId, tipoAccion, n
         await client.close();
         return true;
     } catch (error) {
-        console.error(`[MikroTik] ❌ Error al modificar IP ${ipCliente} en MikroTik:`, error.message);
+        console.error(`[MikroTik] ❌ Error crítico al modificar IP ${ipCliente} en MikroTik:`, error.message);
+        try { await client.close(); } catch(e) {}
         return false;
     }
 }
