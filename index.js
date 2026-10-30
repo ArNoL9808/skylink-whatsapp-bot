@@ -208,52 +208,44 @@ client.initialize();
 function iniciarEscuchasRealtimeSupabase() {
     console.log('[SUPABASE REALTIME] Activando escuchas en tiempo real...');
 
-    // 1. Escuchar cambios en internet_services (Para automatizar cortes / reconexiones en MikroTik por IP)
-    supabase
-      .channel('service-changes-channel')
-      .on(
-        'postgres_changes',
-        { event: 'UPDATE', schema: 'public', table: 'internet_services' },
-        async (payload) => {
-          const nuevoServicio = payload.new;
-          const servicioAnterior = payload.old;
+    const channel = supabase
+        .channel('service-changes-channel')
+        .on(
+            'postgres_changes',
+            { event: 'UPDATE', schema: 'public', table: 'internet_services' },
+            async (payload) => {
+                console.log('🚨 [REALTIME DEBUG] ¡Evento recibido de Supabase!', JSON.stringify(payload, null, 2));
 
-          if (nuevoServicio.is_suspended !== servicioAnterior.is_suspended || nuevoServicio.status !== servicioAnterior.status) {
-              const { data: plan } = await supabase.from('plans').select('name').eq('id', nuevoServicio.plan_id).single();
-              
-              const ipCliente = nuevoServicio.ip;
-              const mikrotikId = nuevoServicio.mikrotik_id;
-              const planName = plan?.name || 'advance gold';
+                const nuevoServicio = payload.new;
+                const servicioAnterior = payload.old;
 
-              if (ipCliente) {
-                  if (nuevoServicio.is_suspended || nuevoServicio.status === 'suspended' || nuevoServicio.status === 'cut') {
-                      console.log(`[REALTIME] Detectada suspensión/corte para IP: ${ipCliente}`);
-                      await aplicarCambioEnMikroTikPorIP(ipCliente, mikrotikId, 'suspender', planName);
-                  } else if (!nuevoServicio.is_suspended && nuevoServicio.status === 'active') {
-                      console.log(`[REALTIME] Detectada reconexión/pago para IP: ${ipCliente}`);
-                      await aplicarCambioEnMikroTikPorIP(ipCliente, mikrotikId, 'reconectar', planName);
-                  }
-              }
-          }
-        }
-      )
-      .subscribe();
+                // Validar si hubo un cambio real en el estatus o suspensión
+                if (
+                    nuevoServicio.is_suspended !== servicioAnterior.is_suspended ||
+                    nuevoServicio.status !== servicioAnterior.status
+                ) {
+                    console.log(`[REALTIME] Cambio detectado para el cliente con IP: ${nuevoServicio.ip || 'Sin IP'}`);
 
-    // 2. Escuchar la cola de WhatsApp (whatsapp_logs) para envío de comprobantes instantáneos
-    supabase
-      .channel('whatsapp-queue-channel')
-      .on(
-        'postgres_changes',
-        { event: 'INSERT', schema: 'public', table: 'whatsapp_logs' },
-        async (payload) => {
-          const logItem = payload.new;
-          if (logItem.status === 'pending') {
-              console.log(`[REALTIME] Nuevo mensaje pendiente detectado (ID: ${logItem.id})`);
-              procesarMensajeIndividual(logItem);
-          }
-        }
-      )
-      .subscribe();
+                    const ipCliente = nuevoServicio.ip;
+                    const mikrotikId = nuevoServicio.mikrotik_id || 'default';
+                    const nombrePlan = nuevoServicio.plan_name || 'advance gold';
+
+                    if (nuevoServicio.is_suspended || nuevoServicio.status === 'suspended' || nuevoServicio.status === 'inactive') {
+                        console.log(`[REALTIME] 🔴 El servicio fue SUSPENDIDO. Aplicando corte en MikroTik...`);
+                        await aplicarCambioEnMikroTikPorIP(ipCliente, mikrotikId, 'suspender', nombrePlan);
+                    } else if (!nuevoServicio.is_suspended && nuevoServicio.status === 'active') {
+                        console.log(`[REALTIME] 🟢 El servicio fue ACTIVADO/PAGADO. Restaurando velocidad en MikroTik...`);
+                        await aplicarCambioEnMikroTikPorIP(ipCliente, mikrotikId, 'activar', nombrePlan);
+                    }
+                }
+            }
+        )
+        .subscribe((status, err) => {
+            console.log(`[SUPABASE REALTIME] Estado de la suscripción: ${status}`);
+            if (err) {
+                console.error('[SUPABASE REALTIME] ❌ Error en la suscripción del canal:', err);
+            }
+        });
 }
 
 // =====================================================================
