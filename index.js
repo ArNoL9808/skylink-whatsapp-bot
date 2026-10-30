@@ -90,7 +90,6 @@ async function aplicarCambioEnMikroTikPorIP(ipCliente, mikrotikId, tipoAccion, p
 
             if (planError || !planData) {
                 console.error(`[MikroTik] ❌ No se encontró el plan con ID ${planId} en la BD. Usando respaldo por defecto.`);
-                // Respaldo de seguridad en caso de que el plan no tenga los campos llenos
                 configPlan = {
                     maxLimit: '10M/10M',
                     burstLimit: '18M/18M',
@@ -111,7 +110,6 @@ async function aplicarCambioEnMikroTikPorIP(ipCliente, mikrotikId, tipoAccion, p
 
         console.log(`[MikroTik] Conectando vía REST API a ${host} para la IP ${ipCliente}...`);
 
-        // 1. Obtener todas las simple queues desde la REST API de MikroTik
         const resQueues = await fetch(`${baseUrl}/queue/simple`, {
             method: 'GET',
             headers: {
@@ -126,8 +124,6 @@ async function aplicarCambioEnMikroTikPorIP(ipCliente, mikrotikId, tipoAccion, p
         }
 
         const queues = await resQueues.json();
-
-        // 2. Buscar la cola que coincida con la IP del cliente en el target
         const queueCliente = queues.find(q => q.target && q.target.includes(ipCliente));
 
         if (!queueCliente) {
@@ -140,7 +136,6 @@ async function aplicarCambioEnMikroTikPorIP(ipCliente, mikrotikId, tipoAccion, p
             ? `SUSPENDIDO - IP: ${ipCliente}` 
             : `Plan Activo ID: ${planId} (${ipCliente})`;
 
-        // 3. Aplicar los cambios mediante una petición PATCH a la REST API
         const resUpdate = await fetch(`${baseUrl}/queue/simple/${queueId}`, {
             method: 'PATCH',
             headers: {
@@ -215,12 +210,13 @@ client.on('disconnected', (reason) => {
     console.log('[WHATSAPP] El cliente fue desconectado:', reason);
 });
 
-// Inicializar el cliente de WhatsApp
 client.initialize();
 
 // =====================================================================
-// ⚡ SUPABASE REALTIME (ESCUCHA AUTOMÁTICA BLINDADA CONTRA FALSOS POSITIVOS)
+// ⚡ SUPABASE REALTIME (MAPA EN MEMORIA CONTRA FALSOS POSITIVOS)
 // =====================================================================
+const estadosClientesMemoria = new Map();
+
 function iniciarEscuchasRealtimeSupabase() {
     console.log('[SUPABASE REALTIME] Activando escuchas en tiempo real...');
 
@@ -233,42 +229,52 @@ function iniciarEscuchasRealtimeSupabase() {
                 console.log('🚨 [REALTIME DEBUG] ¡Evento recibido de Supabase!', JSON.stringify(payload, null, 2));
 
                 const nuevoServicio = payload.new;
-                const servicioAnterior = payload.old;
-
-                // 🛡️ FILTRO DE SEGURIDAD: 
-                // Verificamos estrictamente si los campos de control crítico realmente cambiaron de valor.
-                const cambioSuspension = nuevoServicio.is_suspended !== servicioAnterior.is_suspended;
-                const cambioEstatus = nuevoServicio.status !== servicioAnterior.status;
-
-                // Si se actualizaron otros campos (como IP, notas, ONU, etc.) pero el estatus y la 
-                // suspensión siguen siendo exactamente iguales, IGNORAMOS el evento por completo.
-                if (!cambioSuspension && !cambioEstatus) {
-                    console.log(`[REALTIME] ℹ️ Actualización de datos generales ignorada (IP/Notas/etc.) para el servicio ID: ${nuevoServicio.id}`);
-                    return;
-                }
-
-                console.log(`[REALTIME] ⚠️ Cambio real detectado en estatus/suspensión para la IP: ${nuevoServicio.ip || 'Sin IP'}`);
-
+                const servicioId = nuevoServicio.id;
                 const ipCliente = nuevoServicio.ip;
                 const mikrotikId = nuevoServicio.mikrotik_id || 'default';
                 const planId = nuevoServicio.plan_id;
                 const userId = nuevoServicio.user_id;
 
+                const estadoActual = {
+                    is_suspended: nuevoServicio.is_suspended,
+                    status: nuevoServicio.status
+                };
+
+                // Si es la primera vez que vemos este servicio en memoria, lo guardamos sin disparar acciones
+                if (!estadosClientesMemoria.has(servicioId)) {
+                    estadosClientesMemoria.set(servicioId, estadoActual);
+                    console.log(`[REALTIME] ℹ️ Servicio ${servicioId} registrado en memoria.`);
+                    return;
+                }
+
+                const estadoAnterior = estadosClientesMemoria.get(servicioId);
+
+                // Comparamos el estado real en memoria contra el nuevo recibido
+                const cambioSuspension = estadoActual.is_suspended !== estadoAnterior.is_suspended;
+                const cambioEstatus = estadoActual.status !== estadoAnterior.status;
+
+                // 🛡️ Si actualizan IP, notas o cualquier otro dato general, lo ignoramos por completo
+                if (!cambioSuspension && !cambioEstatus) {
+                    console.log(`[REALTIME] ℹ️ Actualización de datos generales ignorada (IP/Notas/etc.) para el servicio ID: ${servicioId}`);
+                    return;
+                }
+
+                // Actualizamos el estado en memoria
+                estadosClientesMemoria.set(servicioId, estadoActual);
+
+                console.log(`[REALTIME] ⚠️ Cambio real detectado en estatus/suspensión para la IP: ${ipCliente || 'Sin IP'}`);
+
                 let tipoAccion = null;
                 let tipoMensajeWhatsApp = null;
 
-                // Evaluamos las banderas de forma precisa
-                if (nuevoServicio.is_suspended || nuevoServicio.status === 'suspended' || nuevoServicio.status === 'inactive' || nuevoServicio.status === 'cut') {
-                    // Solo procedemos si el estado anterior NO estaba ya suspendido/cortado 
-                    // (evita disparos dobles si Supabase manda múltiples eventos de un mismo cambio)
-                    if (!servicioAnterior.is_suspended && servicioAnterior.status === 'active') {
+                if (estadoActual.is_suspended || estadoActual.status === 'suspended' || estadoActual.status === 'inactive' || estadoActual.status === 'cut') {
+                    if (!estadoAnterior.is_suspended && estadoAnterior.status === 'active') {
                         console.log(`[REALTIME] 🔴 El servicio cambió a SUSPENDIDO. Aplicando corte en MikroTik...`);
                         tipoAccion = 'suspender';
                         tipoMensajeWhatsApp = 'suspendido';
                     }
-                } else if (!nuevoServicio.is_suspended && nuevoServicio.status === 'active') {
-                    // Solo procedemos si antes estaba suspendido o cortado
-                    if (servicioAnterior.is_suspended || servicioAnterior.status === 'suspended' || servicioAnterior.status === 'cut' || servicioAnterior.status === 'inactive') {
+                } else if (!estadoActual.is_suspended && estadoActual.status === 'active') {
+                    if (estadoAnterior.is_suspended || estadoAnterior.status === 'suspended' || estadoAnterior.status === 'cut' || estadoAnterior.status === 'inactive') {
                         console.log(`[REALTIME] 🟢 El servicio cambió a ACTIVO. Restaurando velocidad en MikroTik...`);
                         tipoAccion = 'activar';
                         tipoMensajeWhatsApp = 'activado';
@@ -313,7 +319,7 @@ function iniciarEscuchasRealtimeSupabase() {
                                 
                                 await supabase.from('whatsapp_logs').insert([{
                                     user_id: userId,
-                                    internet_service_id: nuevoServicio.id,
+                                    internet_service_id: servicioId,
                                     message_type: tipoMensajeWhatsApp,
                                     billing_period: nuevoServicio.next_due_date || new Date().toISOString().split('T')[0],
                                     status: 'sent',
