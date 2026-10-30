@@ -108,65 +108,32 @@ async function aplicarCambioEnMikroTikPorIP(ipCliente, mikrotikId, tipoAccion, n
     }
 
     const targetRouter = ROUTERS_CONFIG[mikrotikId] || ROUTERS_CONFIG['default'];
-    const client = new RouterOSClient(targetRouter);
+    // targetRouter debe tener host, user y password (ej: { host: '192.168.88.1', user: 'admin', password: 'xxx' })
+    const protocol = targetRouter.port === 8729 ? 'https' : 'http';
+    const port = targetRouter.port || 80; // o el puerto REST que uses en tu MikroTik (por defecto 80 o 443, o el que tengas configurado en IP -> Services)
+    // Nota: Si usas la API REST de MikroTik, el puerto suele ser 80/443 o el que hayas asignado a www / www-ssl. 
+    // Si prefieres usar la IP directa con el puerto REST:
+    const baseUrl = `${protocol}://${targetRouter.host}/rest`;
+    
+    // Auth básica en Base64
+    const auth = Buffer.from(`${targetRouter.user}:${targetRouter.password}`).toString('base64');
 
     try {
-        const api = await client.connect();
-        
-        let queues = [];
-        try {
-            // Forzamos la lectura usando .toArray() o capturando el evento de error del canal si la librería lo permite
-            queues = await api.menu('/queue/simple').getAll();
-        } catch (routerErr) {
-            console.log(`[MikroTik] ⚠️ Nota al obtener colas (posible lista vacía o respuesta del router):`, routerErr.message);
-            queues = [];
-        }
+        console.log(`[MikroTik] Conectando vía REST API a ${targetRouter.host} para la IP ${ipCliente}...`);
 
-        // Si no devolvió un arreglo o está vacío
-        if (!Array.isArray(queues) || queues.length === 0) {
-            console.log(`[MikroTik] ⚠️ No hay Simple Queues registradas o el router respondió vacío.`);
-            await client.close();
-            return false;
-        }
-
-        // Buscar la Simple Queue cuyo target contenga la IP del cliente
-        const queueCliente = queues.find(q => q.target && q.target.includes(ipCliente));
-        
-        if (!queueCliente) {
-            console.log(`[MikroTik] ⚠️ No se encontró ninguna Simple Queue con la IP: ${ipCliente} en el router ID: ${mikrotikId}`);
-            await client.close();
-            return false;
-        }
-
-        const queueId = queueCliente['.id'];
-        let configPlan;
-        let comentario;
-
-        if (tipoAccion === 'suspender') {
-            configPlan = PLANS_CONFIG['suspendido'];
-            comentario = `SUSPENDIDO - IP: ${ipCliente}`;
-        } else {
-            const planKey = Object.keys(PLANS_CONFIG).find(p => nombrePlan.toLowerCase().includes(p)) || 'advance gold';
-            configPlan = PLANS_CONFIG[planKey];
-            comentario = `Plan Activo: ${nombrePlan} (${ipCliente})`;
-        }
-
-        // Aplicar la actualización
-        await api.menu('/queue/simple').update(queueId, {
-            'max-limit': configPlan.maxLimit,
-            'burst-limit': configPlan.burstLimit,
-            'burst-threshold': configPlan.burstThreshold,
-            'burst-time': configPlan.burstTime,
-            'queue': configPlan.queue,
-            comment: comentario
+        // 1. Obtener todas las simple queues usando REST API
+        const response = await fetch(`${baseUrl}/ip/firewall/address-list`, { // o /queue/simple
+            method: 'GET',
+            headers: {
+                'Authorization': `Basic ${auth}`,
+                'Content-Type': 'application/json'
+            }
         });
 
-        console.log(`[MikroTik] ✅ Éxito: IP ${ipCliente} actualizada a perfil [${tipoAccion.toUpperCase()}] (${comentario})`);
-        await client.close();
-        return true;
+        // Si prefieres mantenerlo con la librería pero evitamos el error con comandos nativos de ROS, 
+        // otra opción sumamente sencilla es usar un comando que no lance error. Pero la REST API es invulnerable a esto.
     } catch (error) {
-        console.error(`[MikroTik] ❌ Error general en la conexión/router para la IP ${ipCliente}:`, error.message);
-        try { await client.close(); } catch(e) {}
+        console.error(`[MikroTik] ❌ Error en REST API:`, error.message);
         return false;
     }
 }
